@@ -808,7 +808,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       const model = provider?.getModels().find(item => item.id === modelId)
       return model === undefined ? undefined : captureVirtualModelTemplate(model)
     }
-    for (const storedConfig of stored) {
+    const applyStoredVirtual = async (storedConfig: VirtualProviderConfig): Promise<void> => {
       const healed = healVirtualTemplates(storedConfig, resolveTemplate)
       if (healed !== undefined) {
         try {
@@ -819,7 +819,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       }
       const config = healed ?? storedConfig
       const prior = virtualConfigs.get(config.id)
-      if (prior !== undefined && JSON.stringify(prior) === JSON.stringify(config)) continue
+      if (prior !== undefined && JSON.stringify(prior) === JSON.stringify(config)) return
       if (prior !== undefined) unregisterVirtualModels(prior)
 
       // Registration runs at extension load, before any session exists; the
@@ -864,6 +864,17 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       pi.registerProvider(virtualProvider)
       virtualProviders.set(config.id, virtualProvider)
       virtualConfigs.set(config.id, config)
+    }
+    // One broken config must not block the remaining registrations or reject
+    // the reconcile that awaits this; registration retries next reconcile.
+    for (const storedConfig of stored) {
+      try {
+        await applyStoredVirtual(storedConfig)
+      } catch (error) {
+        const message = `multiprovider: failed to register virtual provider "${storedConfig.id}": ${errorText(error)}`
+        console.error(message, error)
+        currentContext?.ui.notify(message, 'warning')
+      }
     }
   }
 
