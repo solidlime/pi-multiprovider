@@ -90,6 +90,12 @@ function defaultDisposition(failure: ProviderAttemptFailure): FailureDisposition
   if (status !== undefined && (status >= 500 || status === 408 || status === 425)) {
     return { kind: 'transient', retryable: true }
   }
+  // Connection-level failures carry no HTTP status: a refused socket, DNS
+  // failure, or cut connection is transient and worth retrying (and worth a
+  // backend rotation when the pool has another backing to try).
+  if (/connection refused|econnrefused|enotfound|etimedout|econnreset|eai_again|fetch failed|network|socket hang up|getaddrinfo|connection error/.test(message)) {
+    return { kind: 'transient', retryable: true }
+  }
   return { kind: 'fatal', retryable: false }
 }
 

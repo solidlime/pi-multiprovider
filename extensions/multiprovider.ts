@@ -1387,7 +1387,12 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         ctx.ui.notify(`Removed virtual provider "${outcome.id}".`, 'info')
         return
       }
-      await store.saveVirtualProvider(outcome.draft)
+      try {
+        await store.saveVirtualProvider(outcome.draft)
+      } catch (error) {
+        ctx.ui.notify(`Could not save virtual provider: ${errorText(error)}`, 'error')
+        return
+      }
       await reconcile(ctx)
       const verb = stored.some(candidate => candidate.id === outcome.draft.id) ? 'Saved' : 'Created'
       ctx.ui.notify(`${verb} virtual provider "${outcome.draft.id}". Select "${outcome.draft.models[0]!.id}" on provider "${outcome.draft.id}" in /model.`, 'info')

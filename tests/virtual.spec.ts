@@ -389,6 +389,38 @@ describe('virtual providers', () => {
     expect(attempts.map(attempt => attempt.model)).toEqual(['model-a', 'model-b'])
   })
 
+  it('rotates to the next backend on a fatal pre-stream backend error', async () => {
+    // A fatal (non-retryable) internal error must not surface before the pool
+    // has tried its remaining backends.
+    const { virtual, attempts } = harness(
+      {
+        a: () => errorStream('multiprovider: provider "prov-a" has no enabled accounts'),
+        b: () => okStream('from-b'),
+      },
+      undefined,
+      { errorsBeforeSwitch: 1 },
+    )
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    expect(attempts.map(attempt => attempt.model)).toEqual(['model-a', 'model-b'])
+  })
+
+  it('rotates to the next backend when a backend throws synchronously before output', async () => {
+    const { virtual, attempts } = harness(
+      {
+        a: () => {
+          throw new Error('multiprovider: provider "prov-a" has no enabled accounts')
+        },
+        b: () => okStream('from-b'),
+      },
+      undefined,
+      { errorsBeforeSwitch: 1 },
+    )
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    expect(attempts.map(attempt => attempt.model)).toEqual(['model-a', 'model-b'])
+  })
+
   it('fails over when a backend provider or model is unavailable', async () => {
     const { virtual, attempts } = harness(
       { a: () => okStream('from-a'), b: () => okStream('from-b') },

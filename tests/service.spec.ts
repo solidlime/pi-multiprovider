@@ -223,6 +223,22 @@ describe('MultiProviderService', () => {
     })
   })
 
+  it('classifies connection-level errors as transient', async () => {
+    const service = scheduler()
+    const lease = await service.acquire({ providerId: 'example', excludeAccountIds: ['b'] })
+    expect(lease.release({
+      status: 'failure',
+      error: { message: 'Connection error.', outputStarted: false },
+    })).toMatchObject({ kind: 'transient', retryable: true })
+
+    const refused = scheduler()
+    const refusedLease = await refused.acquire({ providerId: 'example', excludeAccountIds: ['b'] })
+    expect(refusedLease.release({
+      status: 'failure',
+      error: { message: 'connect ECONNREFUSED 127.0.0.1:11434', outputStarted: false },
+    })).toMatchObject({ kind: 'transient', retryable: true })
+  })
+
   it('supports smooth weighted and least-in-flight selection', async () => {
     const weighted = scheduler({ affinity: false, defaultPolicy: 'weighted-round-robin' })
     const selections = await Promise.all(Array.from({ length: 8 }, () => select(weighted)))

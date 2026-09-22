@@ -319,4 +319,29 @@ describe('MultiAuthStore virtual providers', () => {
     }))
     await expect(new MultiAuthStore(path).listVirtualProviders()).rejects.toThrow('malformed models')
   })
+
+  it('accepts provider-namespaced backend model ids while keeping virtual ids strict', async () => {
+    const { store } = await storeFixture()
+    await store.saveVirtualProvider({
+      id: 'pooled',
+      label: 'Pooled',
+      models: [{
+        id: 'ultra',
+        backends: [{ providerId: 'commandcode', modelId: 'xiaomi/mimo-v2.6-flash' }],
+      }],
+    })
+    const stored = await store.getVirtualProvider('pooled')
+    expect(stored?.models[0]?.backends[0]?.modelId).toBe('xiaomi/mimo-v2.6-flash')
+
+    await expect(store.saveVirtualProvider({
+      id: 'pooled',
+      label: 'Pooled',
+      models: [{ id: 'bad/id', backends: [{ providerId: 'prov-a', modelId: 'model-a' }] }],
+    })).rejects.toThrow('virtual model id')
+    await expect(store.saveVirtualProvider({
+      id: 'bad/id',
+      label: 'Pooled',
+      models: [{ id: 'ultra', backends: [{ providerId: 'prov-a', modelId: 'model-a' }] }],
+    })).rejects.toThrow('virtual provider id')
+  })
 })

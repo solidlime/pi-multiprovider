@@ -148,8 +148,22 @@ function assertSchedulerSettings(value: unknown): asserts value is SchedulerSett
 
 const VIRTUAL_ID_SEPARATOR = '::'
 
+// Virtual provider/model ids are scheduler keys: keep them to the same charset
+// the /vprovider editor enforces (no separators, slashes, or colons).
+const VIRTUAL_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i
+// Backend model ids may carry a provider-namespaced slash (e.g.
+// "xiaomi/mimo-v2.6-flash"); everything else stays as strict as a virtual id.
+const BACKEND_MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._/-]*$/i
+
 function assertVirtualId(value: unknown, label: string): asserts value is string {
-  if (typeof value !== 'string' || value.trim() === '' || value.includes(VIRTUAL_ID_SEPARATOR)) {
+  if (typeof value !== 'string' || !VIRTUAL_ID_PATTERN.test(value)) {
+    throw new Error(`multiprovider: malformed virtual ${label}`)
+  }
+  assertSafeKey(value, `virtual ${label}`)
+}
+
+function assertBackendModelId(value: unknown, label: string): asserts value is string {
+  if (typeof value !== 'string' || !BACKEND_MODEL_ID_PATTERN.test(value)) {
     throw new Error(`multiprovider: malformed virtual ${label}`)
   }
   assertSafeKey(value, `virtual ${label}`)
@@ -239,7 +253,7 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
       }
       const backend = backendValue as Partial<VirtualBackend>
       assertVirtualId(backend.providerId, 'backend provider id')
-      assertVirtualId(backend.modelId, 'backend model id')
+      assertBackendModelId(backend.modelId, 'backend model id')
       if (backend.enabled !== undefined && typeof backend.enabled !== 'boolean') {
         throw new Error(`multiprovider: malformed backend enabled for virtual model "${model.id}"`)
       }

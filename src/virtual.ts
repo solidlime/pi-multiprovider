@@ -197,12 +197,15 @@ function virtualStream<TApi extends Api>(
           const target = resolveTarget(dependencies, backend)
           if (typeof target === 'string') {
             lastSetupError = new Error(target)
-            const disposition = lease.release({
+            lease.release({
               status: 'failure',
               error: { message: target, outputStarted: false },
             })
             settled = true
-            if (disposition?.retryable && attempts < maxAttempts && !signal.aborted) continue
+            // A pre-output setup failure rotates to the next untried backend
+            // regardless of disposition; the acquire above throws once none
+            // remain, surfacing lastSetupError.
+            if (attempts < maxAttempts && !signal.aborted) continue
             throw lastSetupError
           }
 
@@ -270,17 +273,23 @@ function virtualStream<TApi extends Api>(
                   }
                   const disposition = lease.release({ status: 'failure', error: failure })
                   settled = true
-                  if (!outputStarted && disposition?.retryable && attempts < maxAttempts) {
+                  if (!outputStarted && attempts < maxAttempts) {
                     lastTerminal = {
                       ...(start === undefined ? {} : { start }),
                       event,
                     }
-                    leaseOutcome = dependencies.onFailover?.({
-                      providerId: schedulerId,
-                      fromAccountId: lease.accountId,
-                      failure,
-                      errorsOnAccount: sameAccountErrors + 1,
-                    }) === true
+                    // Every pre-output failure rotates to the next untried
+                    // backend; a retryable one may instead be claimed by an
+                    // external failover handler (compact-then-retry), while a
+                    // fatal internal error (missing accounts, exhausted
+                    // backends) must not be surfaced before rotating.
+                    leaseOutcome = disposition?.retryable
+                      && dependencies.onFailover?.({
+                        providerId: schedulerId,
+                        fromAccountId: lease.accountId,
+                        failure,
+                        errorsOnAccount: sameAccountErrors + 1,
+                      }) === true
                       ? 'surface'
                       : 'next-account'
                     break
@@ -315,24 +324,25 @@ function virtualStream<TApi extends Api>(
           if (!settled) {
             const error = new Error('Provider stream ended without a terminal event')
             lastSetupError = error
-            const disposition = lease.release({
+            lease.release({
               status: 'failure',
               error: failureFrom(error, response, outputStarted),
             })
             settled = true
-            if (!outputStarted && disposition?.retryable && attempts < maxAttempts) continue
+            if (!outputStarted && attempts < maxAttempts && !signal.aborted) continue
             throw error
           }
         } catch (error) {
           if (!settled) {
-            const disposition = signal.aborted
-              ? lease.release({ status: 'cancelled' })
-              : lease.release({
-                  status: 'failure',
-                  error: failureFrom(error, response, outputStarted),
-                })
+            if (signal.aborted) lease.release({ status: 'cancelled' })
+            else lease.release({
+              status: 'failure',
+              error: failureFrom(error, response, outputStarted),
+            })
             settled = true
-            if (!outputStarted && disposition?.retryable && attempts < maxAttempts) {
+            // A synchronous backend throw before output rotates too, except
+            // when the caller aborted (cancel) — that surfaces immediately.
+            if (!outputStarted && attempts < maxAttempts && !signal.aborted) {
               lastSetupError = error
               continue
             }
