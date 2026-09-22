@@ -1,0 +1,82 @@
+# upstream(main) を fork(main) にマージし、テスト通過時のみリリースして push する
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # 毎週月曜 03:00 UTC
+  workflow_dispatch: # 手動起動
+
+permissions:
+  contents: write # GITHUB_TOKEN で main へ push・タグ作成
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # フル履歴で checkout（rev-list 比較と merge に必要）。認証は persist-credentials に任せる
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      # upstream を追加して main を取得
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/monotykamary/pi-multiprovider.git
+          git fetch upstream main
+
+      # 新コミットの有無を判定（なければ以降のステップをスキップ）
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          COUNT=$(git rev-list --count HEAD..upstream/main)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "upstream is up to date"
+          fi
+
+      # マージ。コンフリクト時は自動解決せず中止して手動対応を促す
+      - name: Merge upstream/main
+        if: steps.check.outputs.count != '0'
+        run: |
+          if ! git merge upstream/main --no-edit; then
+            git merge --abort
+            echo "::error::Merge conflict with upstream/main. Resolve it manually, then re-run this workflow." >&2
+            exit 1
+          fi
+
+      # テストゲート（bun 前提 repo）
+      - name: Setup bun
+        if: steps.check.outputs.count != '0'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        if: steps.check.outputs.count != '0'
+        run: bun install
+
+      - name: Run tests (regression gate)
+        if: steps.check.outputs.count != '0'
+        run: bun run test
+
+      # テスト通過時のみ: バージョンアップ → リリースコミット → タグ → push
+      - name: Bump version, commit and tag
+        if: steps.check.outputs.count != '0'
+        run: |
+          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
+          npm version patch --no-git-tag-version
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(release): sync upstream ${UPSTREAM_SHA}"
+          git tag "v${NEW_VERSION}"
+          echo "NEW_VERSION=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+        id: release
+
+      # force push 禁止。リジェクトされたらそのまま失敗する
+      - name: Push main and tag
+        if: steps.check.outputs.count != '0'
+        run: |
+          git push origin main
+          git push origin "v${{ steps.release.outputs.NEW_VERSION }}"
