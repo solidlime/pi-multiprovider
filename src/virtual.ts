@@ -142,6 +142,25 @@ function resolveTarget(
   return { provider, model }
 }
 
+// In-process subagents can fire their first request before the host finishes
+// installing backing providers (session_start race). Wait briefly for the
+// provider to appear instead of failing the attempt instantly.
+async function resolveTargetWait(
+  dependencies: VirtualProviderDependencies,
+  backend: VirtualBackend,
+  signal: AbortSignal,
+): Promise<{ provider: Provider<Api>; model: Model<Api> } | string> {
+  let target = resolveTarget(dependencies, backend)
+  if (typeof target !== 'string' || !target.endsWith('is not registered')) return target
+  const deadline = Date.now() + 2500
+  while (Date.now() < deadline && !signal.aborted) {
+    await new Promise(resolve => setTimeout(resolve, 200))
+    target = resolveTarget(dependencies, backend)
+    if (typeof target !== 'string' || !target.endsWith('is not registered')) return target
+  }
+  return target
+}
+
 function virtualStream<TApi extends Api>(
   dependencies: VirtualProviderDependencies,
   kind: StreamKind,
@@ -194,7 +213,7 @@ function virtualStream<TApi extends Api>(
         let sameAccountErrors = 0
 
         try {
-          const target = resolveTarget(dependencies, backend)
+          const target = await resolveTargetWait(dependencies, backend, signal)
           if (typeof target === 'string') {
             lastSetupError = new Error(target)
             lease.release({
