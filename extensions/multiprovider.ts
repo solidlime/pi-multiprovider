@@ -845,8 +845,6 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           installedProviders.get(providerId)
           ?? baseProviders.get(providerId)
           ?? sessionContext()?.modelRegistry.getProvider(providerId) as Provider<Api> | undefined,
-        isBackendConfigured: providerId =>
-          sessionContext()?.modelRegistry.getProviderAuthStatus(providerId).configured ?? true,
         resolveAmbientAuth: async (_providerId, model, signal) => {
           const context = sessionContext()
           if (context === undefined) return { ok: false, error: 'multiprovider: session not ready' }

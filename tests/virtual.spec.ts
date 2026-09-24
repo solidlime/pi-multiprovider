@@ -161,7 +161,6 @@ function harness(
   handlers: { a: Handler; b: Handler },
   overrides: {
     missingProviders?: string[]
-    isBackendConfigured?: (providerId: string) => boolean
     affinityKey?: string
   } = {},
   options: {
@@ -207,7 +206,6 @@ function harness(
     getBackingProvider: providerId =>
       overrides.missingProviders?.includes(providerId) ? undefined : providers.get(providerId),
     resolveAmbientAuth: async providerId => ({ ok: true, apiKey: 'ambient-' + providerId }),
-    isBackendConfigured: overrides.isBackendConfigured ?? (() => true),
   }
   const virtual = createVirtualProvider(deps)
   return { service, virtual, attempts, deps }
@@ -475,14 +473,19 @@ describe('virtual providers', () => {
     })])
   })
 
-  it('reports unconfigured auth when no backend provider is configured', async () => {
+  it('resolves placeholder auth deterministically even before backings register', async () => {
+    // Regression: resolve used to consult pi's async availability snapshot and
+    // returned undefined inside the refresh window, surfacing as
+    // "No API key found for <virtual pool>" on fresh sessions/advisors.
     const { virtual } = harness(
       { a: () => okStream('x'), b: () => okStream('x') },
-      { isBackendConfigured: () => false },
+      { missingProviders: ['prov-a', 'prov-b'] },
     )
-    await expect(
-      virtual.auth.apiKey!.resolve({ ctx: authContext, signal: new AbortController().signal }),
-    ).resolves.toBeUndefined()
+    const resolution = await virtual.auth.apiKey!.resolve({
+      ctx: authContext,
+      signal: new AbortController().signal,
+    })
+    expect(resolution).toMatchObject({ auth: { apiKey: 'virtual-provider' }, source: 'virtual provider' })
   })
 
   it('reports placeholder auth once a backend is configured', async () => {

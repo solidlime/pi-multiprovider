@@ -81,7 +81,6 @@ export interface VirtualProviderDependencies {
     model: Model<Api>,
     signal: AbortSignal,
   ) => Promise<AmbientAuthResolution>
-  isBackendConfigured?: (providerId: string) => boolean
   maxAccountAttempts?: number
   onFailover?: (info: FailoverInfo) => boolean | void
 }
@@ -475,9 +474,11 @@ export function createVirtualProvider(dependencies: VirtualProviderDependencies)
             .flatMap(model => model.backends)
             .filter(backend => backend.enabled !== false)
           if (backends.length === 0) return undefined
-          const configured = backends.some(backend =>
-            dependencies.isBackendConfigured?.(backend.providerId) ?? true)
-          if (!configured) return undefined
+          // ponytail: key resolution must be deterministic — a placeholder is
+          // issued whenever an enabled backend exists, and real credential
+          // checks happen at stream time via resolveAmbientAuth. Basing this
+          // on pi's async availability snapshot made resolve() fail inside
+          // the refresh window ("No API key found for <virtual pool>").
           return { auth: { apiKey: VIRTUAL_PLACEHOLDER_API_KEY }, source: 'virtual provider' }
         },
       },
