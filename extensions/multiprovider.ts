@@ -819,7 +819,21 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       }
       const config = healed ?? storedConfig
       const prior = virtualConfigs.get(config.id)
-      if (prior !== undefined && JSON.stringify(prior) === JSON.stringify(config)) return
+      const configUnchanged = prior !== undefined && JSON.stringify(prior) === JSON.stringify(config)
+      if (configUnchanged) {
+        // pi-web shares one modelRegistry across sessions, so a sibling
+        // session's shutdown can drop our entry while our config is intact.
+        // Re-register the same object rather than skipping: a stale skip here
+        // strands the parent session on "Unknown provider". Reusing the
+        // existing object keeps scheduler state single-instanced.
+        const registered = currentContext?.modelRegistry.getProvider(config.id)
+        const ours = virtualProviders.get(config.id)
+        if (registered === ours && ours !== undefined) return
+        if (ours !== undefined) {
+          pi.registerProvider(ours)
+          return
+        }
+      }
       if (prior !== undefined) unregisterVirtualModels(prior)
 
       // Registration runs at extension load, before any session exists; the
@@ -1011,7 +1025,14 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     for (const providerId of installedProviders.keys()) restoreProvider(providerId, currentContext)
     managedIntegrations.clear()
     managedBases.clear()
-    for (const providerId of virtualProviders.keys()) pi.unregisterProvider(providerId)
+    for (const providerId of Array.from(virtualProviders.keys())) {
+      const registered = currentContext?.modelRegistry.getProvider(providerId)
+      // Only unregister what we still own: the shared runtime may already hold
+      // another session's provider object under this id.
+      if (registered === undefined || registered === virtualProviders.get(providerId)) {
+        pi.unregisterProvider(providerId)
+      }
+    }
     virtualProviders.clear()
     virtualIntegrations.clear()
     virtualConfigs.clear()
