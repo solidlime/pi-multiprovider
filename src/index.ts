@@ -1,7 +1,7 @@
 export * from './types.ts'
 export * from './errors.ts'
 export * from './service.ts'
-export { liftProvider } from './lift.ts'
+export { liftProvider, FirstTokenTimeoutError, FIRST_TOKEN_TIMEOUT_MS } from './lift.ts'
 export {
   BACKEND_UNAVAILABLE_PREFIX,
   VIRTUAL_ID_SEPARATOR,

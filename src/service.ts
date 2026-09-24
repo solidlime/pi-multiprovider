@@ -92,8 +92,9 @@ function defaultDisposition(failure: ProviderAttemptFailure): FailureDisposition
   }
   // Connection-level failures carry no HTTP status: a refused socket, DNS
   // failure, or cut connection is transient and worth retrying (and worth a
-  // backend rotation when the pool has another backing to try).
-  if (/connection refused|econnrefused|enotfound|etimedout|econnreset|eai_again|fetch failed|network|socket hang up|getaddrinfo|connection error/.test(message)) {
+  // backend rotation when the pool has another backing to try). A first-token
+  // stall (watchdog timeout) is the same class of transient silence.
+  if (/connection refused|econnrefused|enotfound|etimedout|econnreset|eai_again|fetch failed|network|socket hang up|getaddrinfo|connection error|stalled|no first token/.test(message)) {
     return { kind: 'transient', retryable: true }
   }
   return { kind: 'fatal', retryable: false }

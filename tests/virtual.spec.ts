@@ -13,11 +13,12 @@ import {
   type StopReason,
   type TranscriptContext,
 } from '@earendil-works/pi-ai'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   captureVirtualModelTemplate,
   createVirtualIntegrations,
   createVirtualProvider,
+  FIRST_TOKEN_TIMEOUT_MS,
   healVirtualTemplates,
   type FailoverInfo,
   MultiProviderService,
@@ -122,6 +123,12 @@ function errorStream(errorMessage: string): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream()
   finishWithError(stream, errorMessage)
   return stream
+}
+
+// A backend that accepts the request but never emits — the silent stall that
+// used to hang the turn with no error to fail over on.
+function silentStream(): AssistantMessageEventStream {
+  return createAssistantMessageEventStream()
 }
 
 type Handler = (
@@ -495,5 +502,86 @@ describe('virtual providers', () => {
       signal: new AbortController().signal,
     })
     expect(resolution).toMatchObject({ auth: { apiKey: 'virtual-provider' }, source: 'virtual provider' })
+  })
+})
+
+describe('first-token watchdog', () => {
+  it('fails over to the next backend when the first event never arrives', async () => {
+    vi.useFakeTimers()
+    try {
+      const { virtual, attempts, service } = harness({
+        a: () => silentStream(),
+        b: () => okStream('from-b'),
+      })
+      const eventsPromise = collect(virtual.stream(virtual.getModels()[0]!, context))
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(FIRST_TOKEN_TIMEOUT_MS)
+      const events = await eventsPromise
+      expect(events.at(-1)).toMatchObject({ type: 'done' })
+      expect(attempts.map(attempt => attempt.model)).toEqual(['model-a', 'model-b'])
+      const snapshot = await service.snapshot()
+      expect(snapshot.providers[0]?.accounts.find(account => account.id === 'prov-a::model-a'))
+        .toMatchObject({ status: 'cooldown', consecutiveFailures: 1, inFlight: 0 })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('aborts the stalled inner stream when the watchdog fires', async () => {
+    vi.useFakeTimers()
+    try {
+      let stalledSignal: AbortSignal | undefined
+      const { virtual, attempts } = harness({
+        a: (_model, _context, options) => {
+          stalledSignal = options?.signal
+          return silentStream()
+        },
+        b: () => okStream('from-b'),
+      })
+      const eventsPromise = collect(virtual.stream(virtual.getModels()[0]!, context))
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(FIRST_TOKEN_TIMEOUT_MS)
+      await eventsPromise
+      expect(stalledSignal?.aborted).toBe(true)
+      expect(attempts.map(attempt => attempt.model)).toEqual(['model-a', 'model-b'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('surfaces a timeout error once every silent backend is exhausted', async () => {
+    vi.useFakeTimers()
+    try {
+      const { virtual, attempts } = harness({
+        a: () => silentStream(),
+        b: () => silentStream(),
+      })
+      const eventsPromise = collect(virtual.stream(virtual.getModels()[0]!, context))
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(FIRST_TOKEN_TIMEOUT_MS)
+      await vi.advanceTimersByTimeAsync(FIRST_TOKEN_TIMEOUT_MS)
+      const events = await eventsPromise
+      expect(attempts.map(attempt => attempt.model)).toEqual(['model-a', 'model-b'])
+      const last = events.at(-1)
+      expect(last).toMatchObject({ type: 'error' })
+      expect((last as { error: { errorMessage: string } }).error.errorMessage)
+        .toContain('stalled (no first token in ' + FIRST_TOKEN_TIMEOUT_MS + 'ms)')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('clears the watchdog once the first event arrives', async () => {
+    vi.useFakeTimers()
+    try {
+      const { virtual } = harness({ a: () => okStream('from-a'), b: () => okStream('from-b') })
+      const eventsPromise = collect(virtual.stream(virtual.getModels()[0]!, context))
+      await vi.advanceTimersByTimeAsync(0)
+      const events = await eventsPromise
+      expect(events.at(-1)).toMatchObject({ type: 'done' })
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

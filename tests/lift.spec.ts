@@ -10,13 +10,15 @@ import {
   type StopReason,
   type TranscriptContext,
 } from '@earendil-works/pi-ai'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   liftProvider,
+  FIRST_TOKEN_TIMEOUT_MS,
   type FailoverInfo,
   MultiProviderService,
   type ProviderAccount,
 } from '../src/index.ts'
+import { firstTokenWatchdog } from '../src/lift.ts'
 
 const model: Model<'test-api'> = {
   id: 'same-model',
@@ -397,5 +399,55 @@ describe('liftProvider', () => {
     finish()
     await resultPromise
     expect((await service.snapshot()).providers[0]?.accounts.find(account => account.id === 'a')?.inFlight).toBe(0)
+  })
+
+  it('propagates the consumer break to the inner stream so its cleanup runs', async () => {
+    let closed = 0
+    const inner = (async function* (): AsyncGenerator<string> {
+      try {
+        yield 'first'
+        yield 'second'
+      } finally {
+        closed += 1
+      }
+    })()
+
+    const watchdog = firstTokenWatchdog(inner, new AbortController(), 'a')
+    for await (const value of watchdog) {
+      expect(value).toBe('first')
+      // Mirror the same-account retry path in liftedStream: the consumer
+      // breaks out of the watchdog instead of draining it.
+      break
+    }
+
+    // The break must reach the inner stream's return(), otherwise its body
+    // keeps running and orphans the in-flight request on a released lease.
+    await new Promise(resolve => { setTimeout(resolve, 0) })
+    expect(closed).toBe(1)
+  })
+
+  it('rotates past an account that never emits its first event', async () => {
+    vi.useFakeTimers()
+    try {
+      const attempts: string[] = []
+      const handler: Handler = (_requestModel, _context, options) => {
+        attempts.push(options?.apiKey ?? '')
+        if (options?.apiKey === 'account-a') return createAssistantMessageEventStream()
+        const stream = createAssistantMessageEventStream()
+        finishWithText(stream, 'recovered')
+        return stream
+      }
+
+      const { models, selected } = setup(handler)
+      const resultPromise = models.completeSimple(selected, { messages: [] })
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(FIRST_TOKEN_TIMEOUT_MS)
+      const result = await resultPromise
+      expect(result.stopReason).toBe('stop')
+      expect(result.content).toEqual([{ type: 'text', text: 'recovered' }])
+      expect(attempts).toEqual(['account-a', 'account-b'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

@@ -115,6 +115,75 @@ export function replayTerminal(terminal: BufferedTerminal): AsyncIterable<Assist
   })()
 }
 
+// A backend that accepts a request but never emits an event hangs the turn
+// forever ("Waiting for model...") with no error to fail over on. Guard the
+// first event of every attempt; once one arrives the timer is cleared, so body
+// stalls stay out of scope. 16000ms mirrors the old roundrobin extension.
+export const FIRST_TOKEN_TIMEOUT_MS = 16_000
+
+export class FirstTokenTimeoutError extends Error {
+  readonly backendId: string
+  readonly timeoutMs: number
+
+  constructor(backendId: string, timeoutMs: number) {
+    super('multiprovider: backend ' + backendId + ' stalled (no first token in ' + timeoutMs + 'ms)')
+    this.name = 'FirstTokenTimeoutError'
+    this.backendId = backendId
+    this.timeoutMs = timeoutMs
+  }
+}
+
+// Wrap an attempt's event stream with the first-token watchdog. It owns the
+// linkage from the caller's signal to the per-attempt controller, and on
+// expiry aborts that controller (tearing the backend stream down). The timeout
+// then throws, so the caller's existing pre-output failover path rotates to
+// the next backend — or surfaces it once every backend is exhausted.
+export async function* firstTokenWatchdog<T>(
+  inner: AsyncIterable<T>,
+  controller: AbortController,
+  backendId: string,
+  outerSignal?: AbortSignal,
+  timeoutMs: number = FIRST_TOKEN_TIMEOUT_MS,
+): AsyncGenerator<T> {
+  const onOuterAbort = () => controller.abort(outerSignal?.reason)
+  if (outerSignal?.aborted === true) controller.abort(outerSignal.reason)
+  else outerSignal?.addEventListener('abort', onOuterAbort, { once: true })
+  const iterator = inner[Symbol.asyncIterator]()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new FirstTokenTimeoutError(backendId, timeoutMs)), timeoutMs)
+  })
+  try {
+    let next = await Promise.race([iterator.next(), expired])
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+    if (next.done === true) return
+    yield next.value
+    for (;;) {
+      next = await iterator.next()
+      if (next.done === true) return
+      yield next.value
+    }
+  } catch (error) {
+    if (error instanceof FirstTokenTimeoutError) controller.abort(error)
+    throw error
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    outerSignal?.removeEventListener('abort', onOuterAbort)
+    // Hand the consumer's early exit (break / return) down to the inner
+    // stream so its finally runs and the in-flight request is torn down
+    // instead of outliving the released lease. Stall teardown already went
+    // through controller.abort, so piling return() onto a pending next() is
+    // harmless.
+    try {
+      void Promise.resolve(iterator.return?.()).catch(() => {})
+    } catch {
+      // return() threw synchronously; the stream is already being torn down,
+      // so there is nothing left to unwind here.
+    }
+  }
+}
+
 function liftedStream<TApi extends Api, TCredentialRef>(
   provider: Provider<TApi>,
   service: MultiProviderService,
@@ -214,6 +283,10 @@ function liftedStream<TApi extends Api, TCredentialRef>(
           while (leaseOutcome === undefined) {
             response = undefined
             start = undefined
+            // Each attempt gets its own abort controller so a first-token stall
+            // tears down just this stream; a caller abort propagates in.
+            const attemptController = new AbortController()
+            attemptOptions.signal = attemptController.signal
             const inner = callProvider(
               provider,
               kind,
@@ -223,7 +296,7 @@ function liftedStream<TApi extends Api, TCredentialRef>(
             )
 
             let retriedSameAccount = false
-            for await (const event of inner) {
+            for await (const event of firstTokenWatchdog(inner, attemptController, lease.accountId, signal)) {
               if (event.type === 'start') {
                 start = event
                 continue

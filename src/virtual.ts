@@ -14,6 +14,7 @@ import {
 } from '@earendil-works/pi-ai'
 import {
   failureFrom,
+  firstTokenWatchdog,
   mergeHeaders,
   replayTerminal,
   type BufferedTerminal,
@@ -261,12 +262,16 @@ function virtualStream<TApi extends Api>(
           while (leaseOutcome === undefined) {
             response = undefined
             start = undefined
+            // Each attempt gets its own abort controller so a first-token stall
+            // tears down just this stream; a caller abort propagates in.
+            const attemptController = new AbortController()
+            attemptOptions.signal = attemptController.signal
             const inner = kind === 'streamSimple'
               ? target.provider.streamSimple(streamModel, context, attemptOptions as SimpleStreamOptions)
               : target.provider.stream(streamModel, context, attemptOptions as ApiStreamOptions<Api>)
 
             let retriedSameAccount = false
-            for await (const event of inner) {
+            for await (const event of firstTokenWatchdog(inner, attemptController, lease.accountId, signal)) {
               if (event.type === 'start') {
                 start = event
                 continue
