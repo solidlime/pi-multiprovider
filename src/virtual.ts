@@ -317,7 +317,7 @@ function virtualStream<TApi extends Api>(
                   // here just replays the same stalls (and multiplies the
                   // cooldown each account accrues), so only a plain backend
                   // gets the outer same-account tolerance.
-                  if (!outputStarted && sameAccountErrors + 1 < errorsBeforeSwitch) {
+                  if (!outputStarted && !pooledBackend && sameAccountErrors + 1 < errorsBeforeSwitch) {
                     sameAccountErrors += 1
                     await new Promise(resolve => { setTimeout(resolve, SAME_ACCOUNT_RETRY_DELAY_MS) })
                     if (signal.aborted) {

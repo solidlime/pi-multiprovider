@@ -673,6 +673,74 @@ describe('nested watchdog (virtual over a pooled backing provider)', () => {
     }
   })
 
+  it('does not re-enter a pooled backend whose accounts are already exhausted', async () => {
+    // The pooled backend below owns one account that always fails, so every
+    // inner attempt already burns errorsBeforeSwitch (default 3) tries before
+    // the backend surfaces an error. The outer virtual layer must rotate on
+    // that first error instead of replaying the whole subtree three times.
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    let pooledCalls = 0
+    const pooledOnlyModel: Model<'test-api'> = { ...pooledModel, id: 'only-model' }
+    service.registerProvider({
+      id: 'pooled-backend',
+      label: 'Pooled Backend',
+      accounts: () => [{ id: 'only', label: 'Only', authKind: 'api-key', credentialRef: 'only' }],
+      // Zero cooldown keeps the single account immediately re-available, so an
+      // outer retry really does re-run the whole subtree (as it does in
+      // production while a backing account's short stall cooldown expires).
+      classifyFailure: () => ({ kind: 'transient', retryable: true, cooldownMs: 0 }),
+    })
+    const pooledBase = createProvider<'test-api'>({
+      id: 'pooled-backend',
+      name: 'Pooled Backend',
+      auth: {
+        apiKey: {
+          name: 'key',
+          async resolve() {
+            return { auth: { apiKey: 'placeholder' }, source: 'test' }
+          },
+        },
+      },
+      models: [pooledOnlyModel],
+      api: {
+        stream: () => { pooledCalls += 1; return errorStream('HTTP 503 upstream') },
+        streamSimple: () => { pooledCalls += 1; return errorStream('HTTP 503 upstream') },
+      },
+    })
+    const lifted = liftProvider<'test-api', string>(pooledBase, service, {
+      resolveAuth: account => ({ auth: { apiKey: 'key-' + account.credentialRef } }),
+    })
+    const liveModel: Model<'test-api'> = { ...modelB, id: 'live-model', provider: 'prov-live' }
+    let liveCalls = 0
+    const liveProvider = backend('prov-live', liveModel, () => {
+      liveCalls += 1
+      return okStream('from-live')
+    })
+    const nestedConfig: VirtualProviderConfig = {
+      id: 'outer-nested',
+      label: 'Outer',
+      models: [{
+        id: 'ultra',
+        backends: [
+          { providerId: 'pooled-backend', modelId: pooledOnlyModel.id },
+          { providerId: 'prov-live', modelId: liveModel.id },
+        ],
+      }],
+    }
+    for (const integration of createVirtualIntegrations(nestedConfig)) service.registerProvider(integration)
+    const virtual = createVirtualProvider({
+      service,
+      config: nestedConfig,
+      getAffinityKey: () => 'session-1',
+      getBackingProvider: providerId => (providerId === 'pooled-backend' ? lifted : liveProvider),
+      resolveAmbientAuth: async () => ({ ok: false, error: 'test: no ambient auth' }),
+    })
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    expect(pooledCalls).toBe(3)
+    expect(liveCalls).toBe(1)
+  })
+
   it('propagates a caller cancel into the pooled backend', async () => {
     let innerSignal: AbortSignal | undefined
     let signalCalled: () => void = () => {}
