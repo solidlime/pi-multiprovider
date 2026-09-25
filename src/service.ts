@@ -76,7 +76,24 @@ function statusFromFailure(failure: ProviderAttemptFailure): number | undefined 
   return value === undefined ? undefined : Number(value)
 }
 
-function defaultDisposition(failure: ProviderAttemptFailure): FailureDisposition {
+// A first-token watchdog stall carries the exact threshold that fired, so it
+// can be classified without importing the watchdog module. Ducks the existing
+// FirstTokenTimeoutError (name + timeoutMs) instead of coupling service to it.
+function stallCooldownMs(failure: ProviderAttemptFailure): number | undefined {
+  const cause = failure.cause
+  if (!(cause instanceof Error) || cause.name !== 'FirstTokenTimeoutError') return undefined
+  const timeoutMs = (cause as { timeoutMs?: unknown }).timeoutMs
+  return typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? Math.floor(timeoutMs)
+    : undefined
+}
+
+export function defaultDisposition(failure: ProviderAttemptFailure): FailureDisposition {
+  // A stall is one watchdog window, not exponential backoff material: an
+  // explicit cooldownMs stops consecutiveFailures from compounding a single
+  // silence into hours (the transient base is 1s and doubles per failure).
+  const stallMs = stallCooldownMs(failure)
+  if (stallMs !== undefined) return { kind: 'stall', retryable: true, cooldownMs: stallMs }
   const message = failure.message.toLowerCase()
   const status = statusFromFailure(failure)
   if (status === 429 || /rate.?limit|too many requests|overloaded/.test(message)) {

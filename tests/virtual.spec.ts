@@ -770,3 +770,91 @@ describe('nested watchdog (virtual over a pooled backing provider)', () => {
     expect(events.at(-1)).toMatchObject({ type: 'error' })
   })
 })
+
+// A backing provider registered on the same service is itself a pool: it owns
+// its accounts' cooldowns, so the virtual scheduler must not stack a second,
+// longer cooldown on the backend as a whole. Otherwise the backend stays sealed
+// off long after every inner account recovers. A plain backend keeps its own
+// scheduler cooldown.
+describe('pooled backend cooldown', () => {
+  const pooledModel: Model<'test-api'> = {
+    ...modelB,
+    id: 'pooled-model',
+    provider: 'pooled-backend',
+  }
+  const plainModel: Model<'test-api'> = {
+    ...modelB,
+    id: 'plain-model',
+    provider: 'plain-backend',
+  }
+
+  function build() {
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    service.registerProvider({
+      id: 'pooled-backend',
+      label: 'Pooled Backend',
+      accounts: () => [{ id: 'acct', label: 'Acct', authKind: 'api-key', credentialRef: 'acct' }],
+    })
+    const pooledBase = createProvider<'test-api'>({
+      id: 'pooled-backend',
+      name: 'Pooled Backend',
+      auth: {
+        apiKey: {
+          name: 'key',
+          async resolve() {
+            return { auth: { apiKey: 'placeholder' }, source: 'test' }
+          },
+        },
+      },
+      models: [pooledModel],
+      api: {
+        stream: () => errorStream('HTTP 503 upstream'),
+        streamSimple: () => errorStream('HTTP 503 upstream'),
+      },
+    })
+    const lifted = liftProvider<'test-api', string>(pooledBase, service, {
+      resolveAuth: account => ({ auth: { apiKey: 'key-' + account.credentialRef } }),
+    })
+    const plain = backend('plain-backend', plainModel, () => errorStream('HTTP 503 upstream'))
+    const cfg: VirtualProviderConfig = {
+      id: 'outer-cooldown',
+      label: 'Outer Cooldown',
+      models: [{
+        id: 'ultra',
+        backends: [
+          { providerId: 'pooled-backend', modelId: pooledModel.id },
+          { providerId: 'plain-backend', modelId: plainModel.id },
+        ],
+      }],
+    }
+    for (const integration of createVirtualIntegrations(cfg, {
+      isPooledBackend: providerId => service.hasProvider(providerId),
+    })) {
+      service.registerProvider(integration)
+    }
+    const virtual = createVirtualProvider({
+      service,
+      config: cfg,
+      getAffinityKey: () => 'session-1',
+      getBackingProvider: providerId =>
+        providerId === 'pooled-backend' ? lifted
+          : providerId === 'plain-backend' ? plain
+            : undefined,
+      resolveAmbientAuth: async () => ({ ok: false, error: 'test: no ambient auth' }),
+    })
+    return { service, virtual }
+  }
+
+  it('leaves a failed pooled backend immediately re-selectable but cools a plain one', async () => {
+    const { service, virtual } = build()
+    await collect(virtual.stream(virtual.getModels()[0]!, context))
+    const scheduler = (await service.snapshot()).providers
+      .find(provider => provider.id === virtualSchedulerId('outer-cooldown', 'ultra'))
+    const pooled = scheduler?.accounts.find(account => account.id === 'pooled-backend::pooled-model')
+    const plain = scheduler?.accounts.find(account => account.id === 'plain-backend::plain-model')
+    expect(pooled).toMatchObject({ status: 'ready' })
+    expect(pooled?.cooldownUntil).toBeUndefined()
+    expect(plain?.status).toBe('cooldown')
+    expect(plain?.cooldownUntil).toBeGreaterThan(Date.now())
+  })
+})

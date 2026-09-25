@@ -12,7 +12,7 @@ import type { ExtensionContext } from '@earendil-works/pi-coding-agent'
 
 export type AuthKind = 'api-key' | 'oauth' | 'service-account' | 'custom'
 export type SelectionPolicy = 'round-robin' | 'weighted-round-robin' | 'least-inflight' | 'priority'
-export type FailureKind = 'rate-limit' | 'quota' | 'auth' | 'transient' | 'fatal'
+export type FailureKind = 'rate-limit' | 'quota' | 'auth' | 'transient' | 'stall' | 'fatal'
 
 // How plain round-robin breaks ties when no session pin exists. 'first-account'
 // always starts at the first healthy account in pool order (the "main"

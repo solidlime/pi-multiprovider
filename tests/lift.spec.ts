@@ -474,3 +474,69 @@ describe('first-token watchdog threshold', () => {
     }
   })
 })
+
+// A stall is not exponential backoff material: the watchdog threshold is the
+// whole story, so a pool that keeps stalling never compounds one 30s silence
+// into hours.
+describe('stall disposition', () => {
+  function stallSetup() {
+    const service = new MultiProviderService({ errorsBeforeSwitch: 1 })
+    service.registerProvider({
+      id: model.provider,
+      label: 'Same Provider',
+      accounts: () => [accounts[0]!],
+    })
+    const lifted = liftProvider<'test-api', string>(
+      baseProvider(() => createAssistantMessageEventStream()),
+      service,
+      {
+        resolveAuth: account => ({ auth: { apiKey: account.credentialRef }, source: 'test' }),
+        maxAccountAttempts: 1,
+      },
+    )
+    const models = createModels()
+    models.setProvider(lifted)
+    const selected = models.getModel(model.provider, model.id)
+    if (selected === undefined) throw new Error('test model missing')
+    return { service, models, selected }
+  }
+
+  async function runStall(
+    models: ReturnType<typeof stallSetup>['models'],
+    selected: ReturnType<typeof stallSetup>['selected'],
+  ): Promise<void> {
+    const drain = (async () => {
+      try {
+        for await (const _event of models.streamSimple(selected, { messages: [] })) {
+          // drain to the terminal event
+        }
+      } catch {
+        // pi-ai may surface the stall as a thrown error or a terminal error
+        // event depending on the entry point; either way the lease settles.
+      }
+    })()
+    await vi.advanceTimersByTimeAsync(FIRST_TOKEN_TIMEOUT_MS)
+    await drain
+  }
+
+  it('cools a stalled account for exactly the watchdog threshold, not exponentially', async () => {
+    vi.useFakeTimers()
+    try {
+      const { service, models, selected } = stallSetup()
+
+      await runStall(models, selected)
+      const first = (await service.snapshot()).providers[0]?.accounts.find(account => account.id === 'a')
+      expect(first).toMatchObject({ lastFailureKind: 'stall', consecutiveFailures: 1 })
+      expect((first?.cooldownUntil ?? 0) - Date.now()).toBe(FIRST_TOKEN_TIMEOUT_MS)
+
+      await vi.advanceTimersByTimeAsync(FIRST_TOKEN_TIMEOUT_MS + 1)
+      await runStall(models, selected)
+      const second = (await service.snapshot()).providers[0]?.accounts.find(account => account.id === 'a')
+      expect(second).toMatchObject({ lastFailureKind: 'stall', consecutiveFailures: 2 })
+      // Still one threshold, not 2^(n-1) × the base cooldown.
+      expect((second?.cooldownUntil ?? 0) - Date.now()).toBe(FIRST_TOKEN_TIMEOUT_MS)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

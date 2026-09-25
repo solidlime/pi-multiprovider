@@ -20,6 +20,7 @@ import {
   type BufferedTerminal,
 } from './lift.ts'
 import { debugLog, shortId } from './debug.ts'
+import { defaultDisposition } from './service.ts'
 import type { MultiProviderService } from './service.ts'
 import type {
   AccountLease,
@@ -90,6 +91,12 @@ export interface VirtualProviderDependencies {
 export interface VirtualIntegrationOptions {
   getProviderLabel?: (providerId: string) => string | undefined
   maxAccountAttempts?: number
+  // A backing provider registered on the same service is itself a pool with
+  // its own per-account cooldowns. Stacking the virtual scheduler's kind-based
+  // cooldown on the backend as a whole seals it off long after every inner
+  // account recovers, so pooled backends get an explicit 0ms cooldown and stay
+  // immediately re-selectable. Plain backends keep their own cooldown.
+  isPooledBackend?: (providerId: string) => boolean
 }
 
 // One scheduler registration per virtual model: each model's backends pool
@@ -114,15 +121,20 @@ export function createVirtualIntegrations(
           weight: backend.weight ?? 1,
           metadata: { virtual: true, providerId: backend.providerId, modelId: backend.modelId },
         })),
-    classifyFailure: (failure: ProviderAttemptFailure) => {
+    classifyFailure: (failure: ProviderAttemptFailure, account) => {
       const message = failure.message.toLowerCase()
-      if (
-        failure.message.startsWith(BACKEND_UNAVAILABLE_PREFIX)
+      const transient = failure.message.startsWith(BACKEND_UNAVAILABLE_PREFIX)
         || /fetch failed|network|econn(?:aborted|refused|reset)|enotfound|etimedout|socket hang up|not configured/.test(message)
-      ) {
-        return { kind: 'transient' as const, retryable: true }
+      const classification = transient
+        ? { kind: 'transient' as const, retryable: true }
+        : undefined
+      if (options.isPooledBackend?.(account.credentialRef.providerId) === true) {
+        return {
+          ...(classification ?? defaultDisposition(failure)),
+          cooldownMs: 0,
+        }
       }
-      return undefined
+      return classification
     },
     ...(options.maxAccountAttempts === undefined ? {} : { maxAccountAttempts: options.maxAccountAttempts }),
   }))

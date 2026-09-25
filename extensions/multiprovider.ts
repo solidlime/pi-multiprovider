@@ -843,7 +843,12 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         baseProviders.get(providerId)?.name
         ?? sessionContext()?.modelRegistry.getProvider(providerId)?.name
 
-      const integrations = createVirtualIntegrations(config, { getProviderLabel: providerLabel })
+      const integrations = createVirtualIntegrations(config, {
+        getProviderLabel: providerLabel,
+        // Reuse the same service.hasProvider route the stream uses to decide a
+        // backend is itself pooled (it owns its accounts' cooldowns).
+        isPooledBackend: providerId => service.hasProvider(providerId),
+      })
       for (const integration of integrations) {
         unregisterSchedulers.get(integration.id)?.()
         unregisterSchedulers.set(integration.id, service.registerProvider(integration))

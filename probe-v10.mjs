@@ -176,7 +176,9 @@ async function main() {
 
   const commandcode = commandcodeStandIn()
 
-  for (const integration of createVirtualIntegrations(vconfig, {})) {
+  for (const integration of createVirtualIntegrations(vconfig, {
+    isPooledBackend: providerId => service.hasProvider(providerId),
+  })) {
     service.registerProvider(integration)
   }
 
