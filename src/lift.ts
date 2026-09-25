@@ -119,13 +119,14 @@ export function replayTerminal(terminal: BufferedTerminal): AsyncIterable<Assist
 // A backend that accepts a request but never emits an event hangs the turn
 // forever ("Waiting for model...") with no error to fail over on. Guard the
 // first event of every attempt; once one arrives the timer is cleared, so body
-// stalls stay out of scope. 16000ms mirrors the old roundrobin extension.
+// stalls stay out of scope. 30000ms is the live-tuned ceiling (the historical
+// 16000ms came from the old roundrobin extension).
 //
-// The stall was observed to fire on merely-slow live backends (opencode-go was
+// A stall was observed to fire on merely-slow live backends (opencode-go was
 // measured at ~17s to first byte), so the ceiling is tunable per deployment via
 // MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS without a release; an unset or invalid
-// value keeps the historical 16s.
-export const FIRST_TOKEN_TIMEOUT_MS = 16_000
+// value keeps the 30s default.
+export const FIRST_TOKEN_TIMEOUT_MS = 30_000
 
 export function resolveFirstTokenTimeoutMs(): number {
   const raw = process.env.MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS

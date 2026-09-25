@@ -18,7 +18,7 @@ import {
   MultiProviderService,
   type ProviderAccount,
 } from '../src/index.ts'
-import { firstTokenWatchdog } from '../src/lift.ts'
+import { firstTokenWatchdog, resolveFirstTokenTimeoutMs } from '../src/lift.ts'
 
 const model: Model<'test-api'> = {
   id: 'same-model',
@@ -448,6 +448,29 @@ describe('liftProvider', () => {
       expect(attempts).toEqual(['account-a', 'account-b'])
     } finally {
       vi.useRealTimers()
+    }
+  })
+})
+
+// A silent backend now defaults to a 30s ceiling (the historical 16s tuned for
+// the old roundrobin extension); the env override stays the tuning valve and an
+// unset or invalid value falls back to the default.
+describe('first-token watchdog threshold', () => {
+  it('defaults to 30s and ignores an invalid override', () => {
+    const original = process.env.MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS
+    try {
+      delete process.env.MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS
+      expect(FIRST_TOKEN_TIMEOUT_MS).toBe(30_000)
+      expect(resolveFirstTokenTimeoutMs()).toBe(30_000)
+
+      process.env.MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS = '4500'
+      expect(resolveFirstTokenTimeoutMs()).toBe(4500)
+
+      process.env.MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS = 'not-a-number'
+      expect(resolveFirstTokenTimeoutMs()).toBe(30_000)
+    } finally {
+      if (original === undefined) delete process.env.MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS
+      else process.env.MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS = original
     }
   })
 })
