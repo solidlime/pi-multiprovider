@@ -1,4 +1,5 @@
 import { randomInt, randomUUID } from 'node:crypto'
+import { debugLog, shortId } from './debug.ts'
 import { NoAccountAvailableError, UnknownAccountError, UnknownProviderError } from './errors.ts'
 import { SCHEDULER_SETTING_KEYS } from './types.ts'
 import type {
@@ -164,6 +165,17 @@ export class MultiProviderService {
     const accounts = await this.effectiveAccounts(registration, pool)
     const excluded = new Set(options.excludeAccountIds ?? [])
     const now = this.now()
+    debugLog('acquire.start', {
+      pool: options.providerId,
+      affinityKey: shortId(options.affinityKey),
+      excluded: [...excluded].map(shortId),
+      accounts: accounts.map(item => ({
+        id: shortId(item.account.id),
+        enabled: item.enabled,
+        coolingForMs: Math.max(0, item.runtime.cooldownUntil - now),
+        failures: item.runtime.consecutiveFailures,
+      })),
+    })
     const available = accounts.filter(item =>
       item.enabled && item.runtime.cooldownUntil <= now && !excluded.has(item.account.id),
     )
@@ -172,6 +184,13 @@ export class MultiProviderService {
       const future = accounts
         .filter(item => item.enabled && !excluded.has(item.account.id) && item.runtime.cooldownUntil > now)
         .map(item => item.runtime.cooldownUntil)
+      debugLog('acquire.none', {
+        pool: options.providerId,
+        excluded: [...excluded].map(shortId),
+        cooldownRemainingMs: accounts
+          .filter(item => item.runtime.cooldownUntil > now)
+          .map(item => ({ id: shortId(item.account.id), remainingMs: item.runtime.cooldownUntil - now })),
+      })
       throw new NoAccountAvailableError(
         options.providerId,
         future.length === 0 ? undefined : Math.min(...future),
@@ -199,7 +218,16 @@ export class MultiProviderService {
         selected = available.find(item => item.account.id === pinnedId)
       }
     }
+    const fromPin = selected !== undefined
     selected ??= this.select(options.providerId, pool.policy, available)
+    debugLog('acquire.pick', {
+      pool: options.providerId,
+      account: shortId(selected.account.id),
+      source: fromPin ? (explicitPin ? 'explicit-pin' : 'affinity-pin') : 'select',
+      pinnedId: shortId(pinnedId),
+      poolAffinity: pool.affinity,
+      policy: pool.policy,
+    })
 
     if (options.affinityKey !== undefined && pool.affinity && !explicitPin) {
       let table = this.affinity.get(options.providerId)
@@ -208,6 +236,11 @@ export class MultiProviderService {
         this.affinity.set(options.providerId, table)
       }
       table.set(options.affinityKey, selected.account.id)
+      debugLog('affinity.set', {
+        pool: options.providerId,
+        affinityKey: shortId(options.affinityKey),
+        account: shortId(selected.account.id),
+      })
     }
 
     selected.runtime.inFlight += 1
@@ -433,6 +466,13 @@ export class MultiProviderService {
     policy: SelectionPolicy,
     accounts: EffectiveAccount[],
   ): EffectiveAccount {
+    debugLog('select', {
+      pool: providerId,
+      policy,
+      bias: this.selectionBias.get(providerId) ?? DEFAULT_SELECTION_BIAS,
+      cursor: this.roundRobinCursor.get(providerId),
+      accounts: accounts.map(item => shortId(item.account.id)),
+    })
     // Every policy below follows pool (inventory) order — the order the
     // operator configured — never a re-sort by account id.
     if (policy === 'least-inflight') {
@@ -471,6 +511,7 @@ export class MultiProviderService {
     }
     const selected = accounts[cursor % accounts.length]!
     this.roundRobinCursor.set(providerId, (cursor + 1) % accounts.length)
+    debugLog('select.cursor', { pool: providerId, from: cursor, to: (cursor + 1) % accounts.length })
     return selected
   }
 
@@ -502,6 +543,7 @@ export class MultiProviderService {
     runtime.consecutiveFailures = 0
     runtime.cooldownUntil = 0
     delete runtime.lastFailureKind
+    debugLog('release.success', { pool: providerId, account: shortId(accountId) })
   }
 
   private recordFailure(
@@ -521,10 +563,17 @@ export class MultiProviderService {
     runtime.lastFailureKind = disposition.kind
     const cooldown = disposition.cooldownMs
       ?? this.defaultCooldown(disposition.kind, runtime.consecutiveFailures)
-    runtime.cooldownUntil = Math.max(
-      runtime.cooldownUntil,
-      this.now() + Math.min(this.defaults.maxCooldownMs, Math.max(0, cooldown)),
-    )
+    const applied = Math.min(this.defaults.maxCooldownMs, Math.max(0, cooldown))
+    runtime.cooldownUntil = Math.max(runtime.cooldownUntil, this.now() + applied)
+    debugLog('release.failure', {
+      pool: registration.id,
+      account: shortId(account.id),
+      kind: disposition.kind,
+      retryable: disposition.retryable,
+      failures: runtime.consecutiveFailures,
+      cooldownMs: applied,
+      message: failure.message.slice(0, 200),
+    })
     return disposition
   }
 

@@ -14,6 +14,7 @@ import {
   type TranscriptContext,
 } from '@earendil-works/pi-ai'
 import { MultiProviderService } from './service.ts'
+import { debugLog, shortId } from './debug.ts'
 import type {
   AccountLease,
   LiftProviderOptions,
@@ -119,7 +120,18 @@ export function replayTerminal(terminal: BufferedTerminal): AsyncIterable<Assist
 // forever ("Waiting for model...") with no error to fail over on. Guard the
 // first event of every attempt; once one arrives the timer is cleared, so body
 // stalls stay out of scope. 16000ms mirrors the old roundrobin extension.
+//
+// The stall was observed to fire on merely-slow live backends (opencode-go was
+// measured at ~17s to first byte), so the ceiling is tunable per deployment via
+// MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS without a release; an unset or invalid
+// value keeps the historical 16s.
 export const FIRST_TOKEN_TIMEOUT_MS = 16_000
+
+export function resolveFirstTokenTimeoutMs(): number {
+  const raw = process.env.MULTIPROVIDER_FIRST_TOKEN_TIMEOUT_MS
+  const parsed = raw === undefined ? Number.NaN : Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : FIRST_TOKEN_TIMEOUT_MS
+}
 
 export class FirstTokenTimeoutError extends Error {
   readonly backendId: string
@@ -143,7 +155,7 @@ export async function* firstTokenWatchdog<T>(
   controller: AbortController,
   backendId: string,
   outerSignal?: AbortSignal,
-  timeoutMs: number = FIRST_TOKEN_TIMEOUT_MS,
+  timeoutMs: number = resolveFirstTokenTimeoutMs(),
 ): AsyncGenerator<T> {
   const onOuterAbort = () => controller.abort(outerSignal?.reason)
   if (outerSignal?.aborted === true) controller.abort(outerSignal.reason)
@@ -151,7 +163,10 @@ export async function* firstTokenWatchdog<T>(
   const iterator = inner[Symbol.asyncIterator]()
   let timer: ReturnType<typeof setTimeout> | undefined
   const expired = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new FirstTokenTimeoutError(backendId, timeoutMs)), timeoutMs)
+    timer = setTimeout(() => {
+      debugLog('watchdog.fire', { backend: backendId, timeoutMs })
+      reject(new FirstTokenTimeoutError(backendId, timeoutMs))
+    }, timeoutMs)
   })
   try {
     let next = await Promise.race([iterator.next(), expired])
@@ -210,6 +225,12 @@ function liftedStream<TApi extends Api, TCredentialRef>(
     let lastSetupError: unknown
 
     const attemptsStream = (async function* (): AsyncGenerator<AssistantMessageEvent> {
+      debugLog('lift.stream-start', {
+        pool: provider.id,
+        model: model.id,
+        affinityKey: shortId(affinityKey),
+        excluded: [...attempted].map(shortId),
+      })
       while (attempts < maxAttempts) {
         let lease: AccountLease<TCredentialRef>
         try {
@@ -220,6 +241,7 @@ function liftedStream<TApi extends Api, TCredentialRef>(
           })
         } catch (error) {
           if (lastRejected !== undefined) {
+            debugLog('lift.exhausted', { pool: provider.id, replaying: 'buffered-terminal' })
             yield* replayTerminal(lastRejected)
             return
           }
@@ -228,6 +250,12 @@ function liftedStream<TApi extends Api, TCredentialRef>(
 
         attempts += 1
         attempted.add(lease.accountId)
+        debugLog('lift.attempt', {
+          pool: provider.id,
+          account: shortId(lease.accountId),
+          attempt: attempts,
+          affinityKey: shortId(affinityKey),
+        })
         let settled = false
         let outputStarted = false
         let start: BufferedTerminal['start']
@@ -326,6 +354,14 @@ function liftedStream<TApi extends Api, TCredentialRef>(
                   }
                   const disposition = lease.release({ status: 'failure', error: failure })
                   settled = true
+                  debugLog('lift.error-event', {
+                    pool: provider.id,
+                    account: shortId(lease.accountId),
+                    retryable: disposition?.retryable,
+                    kind: disposition?.kind,
+                    outputStarted,
+                    errorsOnAccount: sameAccountErrors + 1,
+                  })
                   if (!outputStarted && disposition?.retryable && attempts < maxAttempts) {
                     lastRejected = {
                       ...(start === undefined ? {} : { start }),
@@ -339,6 +375,11 @@ function liftedStream<TApi extends Api, TCredentialRef>(
                     }) === true
                       ? 'surface'
                       : 'next-account'
+                    debugLog('lift.rotate', {
+                      pool: provider.id,
+                      from: shortId(lease.accountId),
+                      outcome: leaseOutcome,
+                    })
                     break
                   }
                 }
@@ -388,6 +429,15 @@ function liftedStream<TApi extends Api, TCredentialRef>(
                   error: failureFrom(error, response, outputStarted),
                 })
             settled = true
+            debugLog('lift.throw', {
+              pool: provider.id,
+              account: shortId(lease.accountId),
+              retryable: disposition?.retryable,
+              kind: disposition?.kind,
+              outputStarted,
+              aborted: signal.aborted,
+              message: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160),
+            })
             if (!outputStarted && disposition?.retryable && attempts < maxAttempts) {
               lastSetupError = error
               continue

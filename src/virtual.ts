@@ -19,6 +19,7 @@ import {
   replayTerminal,
   type BufferedTerminal,
 } from './lift.ts'
+import { debugLog, shortId } from './debug.ts'
 import type { MultiProviderService } from './service.ts'
 import type {
   AccountLease,
@@ -182,6 +183,11 @@ function virtualStream<TApi extends Api>(
     let lastSetupError: unknown
 
     const attemptsStream = (async function* (): AsyncGenerator<AssistantMessageEvent> {
+      debugLog('virtual.stream-start', {
+        virtual: config.id,
+        model: model.id,
+        affinityKey: shortId(affinityKey),
+      })
       while (attempts < maxAttempts) {
         let lease: AccountLease<VirtualBackend>
         try {
@@ -201,6 +207,13 @@ function virtualStream<TApi extends Api>(
         attempts += 1
         attempted.add(lease.accountId)
         const backend = lease.credentialRef
+        debugLog('virtual.attempt', {
+          virtual: config.id,
+          model: model.id,
+          backend: lease.accountId,
+          attempt: attempts,
+          affinityKey: shortId(affinityKey),
+        })
         let settled = false
         let outputStarted = false
         let start: BufferedTerminal['start']
@@ -216,6 +229,7 @@ function virtualStream<TApi extends Api>(
           const target = await resolveTargetWait(dependencies, backend, signal)
           if (typeof target === 'string') {
             lastSetupError = new Error(target)
+            debugLog('virtual.backend-unavailable', { virtual: config.id, backend: lease.accountId, detail: target.slice(0, 160) })
             lease.release({
               status: 'failure',
               error: { message: target, outputStarted: false },
@@ -270,6 +284,12 @@ function virtualStream<TApi extends Api>(
             // hand it the caller signal untouched instead.
             const attemptController = new AbortController()
             const pooledBackend = service.hasProvider(backend.providerId)
+            debugLog('virtual.stream-call', {
+              virtual: config.id,
+              backend: lease.accountId,
+              pooled: pooledBackend,
+              watchDog: pooledBackend ? 'inner' : 'outer',
+            })
             attemptOptions.signal = pooledBackend ? signal : attemptController.signal
             const inner = kind === 'streamSimple'
               ? target.provider.streamSimple(streamModel, context, attemptOptions as SimpleStreamOptions)
@@ -291,6 +311,12 @@ function virtualStream<TApi extends Api>(
                   settled = true
                 } else {
                   const failure = failureFrom(undefined, response, outputStarted, event.error)
+                  // A pooled backend owns its own per-account tolerance and
+                  // rotation, so an error it surfaces already means every
+                  // account underneath was tried. Re-entering the whole subtree
+                  // here just replays the same stalls (and multiplies the
+                  // cooldown each account accrues), so only a plain backend
+                  // gets the outer same-account tolerance.
                   if (!outputStarted && sameAccountErrors + 1 < errorsBeforeSwitch) {
                     sameAccountErrors += 1
                     await new Promise(resolve => { setTimeout(resolve, SAME_ACCOUNT_RETRY_DELAY_MS) })
@@ -304,6 +330,14 @@ function virtualStream<TApi extends Api>(
                   }
                   const disposition = lease.release({ status: 'failure', error: failure })
                   settled = true
+                  debugLog('virtual.error-event', {
+                    virtual: config.id,
+                    backend: lease.accountId,
+                    retryable: disposition?.retryable,
+                    kind: disposition?.kind,
+                    outputStarted,
+                    errorsOnAccount: sameAccountErrors + 1,
+                  })
                   if (!outputStarted && attempts < maxAttempts) {
                     lastTerminal = {
                       ...(start === undefined ? {} : { start }),
@@ -323,6 +357,12 @@ function virtualStream<TApi extends Api>(
                       }) === true
                       ? 'surface'
                       : 'next-account'
+                    debugLog('virtual.rotate', {
+                      virtual: config.id,
+                      from: lease.accountId,
+                      outcome: leaseOutcome,
+                      message: event.error?.errorMessage?.slice(0, 160),
+                    })
                     break
                   }
                 }
@@ -373,6 +413,13 @@ function virtualStream<TApi extends Api>(
             settled = true
             // A synchronous backend throw before output rotates too, except
             // when the caller aborted (cancel) — that surfaces immediately.
+            debugLog('virtual.throw', {
+              virtual: config.id,
+              backend: lease.accountId,
+              outputStarted,
+              aborted: signal.aborted,
+              message: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160),
+            })
             if (!outputStarted && attempts < maxAttempts && !signal.aborted) {
               lastSetupError = error
               continue
@@ -387,6 +434,7 @@ function virtualStream<TApi extends Api>(
       }
 
       if (lastTerminal !== undefined) {
+        debugLog('virtual.exhausted', { virtual: config.id, replaying: 'buffered-terminal' })
         yield* replayTerminal(lastTerminal)
         return
       }
