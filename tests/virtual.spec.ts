@@ -21,7 +21,9 @@ import {
   FIRST_TOKEN_TIMEOUT_MS,
   healVirtualTemplates,
   type FailoverInfo,
+  liftProvider,
   MultiProviderService,
+  type ProviderAccount,
   virtualSchedulerId,
   type VirtualProviderConfig,
   type VirtualProviderDependencies,
@@ -583,5 +585,120 @@ describe('first-token watchdog', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+// The real-device shape: a virtual pool over a backing provider that is itself
+// pooled (registered on the same service, with its own watchdog + rotation).
+// The inner pool must own stall recovery; a second watchdog on the virtual
+// side would fire first and cancel the inner rotation.
+describe('nested watchdog (virtual over a pooled backing provider)', () => {
+  const pooledModel: Model<'test-api'> = {
+    ...modelA,
+    id: 'same-model',
+    name: 'Same Model',
+    provider: 'pooled-backend',
+    baseUrl: 'https://pooled.invalid',
+  }
+
+  const backendAccounts: ProviderAccount<string>[] = [
+    { id: 'acct-slow', label: 'Slow', authKind: 'api-key', credentialRef: 'acct-slow' },
+    { id: 'acct-fast', label: 'Fast', authKind: 'api-key', credentialRef: 'acct-fast' },
+  ]
+
+  function nested(
+    handler: (accountId: string, options?: SimpleStreamOptions) => AssistantMessageEventStream,
+  ) {
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    service.registerProvider({
+      id: 'pooled-backend',
+      label: 'Pooled Backend',
+      selectionBias: 'first-account',
+      accounts: () => backendAccounts,
+    })
+    const base = createProvider<'test-api'>({
+      id: 'pooled-backend',
+      name: 'Pooled Backend',
+      auth: {
+        apiKey: {
+          name: 'key',
+          async resolve() {
+            return { auth: { apiKey: 'outer-placeholder' }, source: 'test' }
+          },
+        },
+      },
+      models: [pooledModel],
+      api: {
+        stream: (_model, _context, options) =>
+          handler(String(options?.apiKey).replace(/^key-/, ''), options),
+        streamSimple: (_model, _context, options) =>
+          handler(String(options?.apiKey).replace(/^key-/, ''), options),
+      },
+    })
+    const lifted = liftProvider<'test-api', string>(base, service, {
+      resolveAuth: account => ({ auth: { apiKey: 'key-' + account.credentialRef } }),
+    })
+    const config: VirtualProviderConfig = {
+      id: 'outer',
+      label: 'Outer',
+      models: [{ id: 'ultra', backends: [{ providerId: 'pooled-backend', modelId: pooledModel.id }] }],
+    }
+    for (const integration of createVirtualIntegrations(config)) service.registerProvider(integration)
+    const virtual = createVirtualProvider({
+      service,
+      config,
+      getAffinityKey: () => 'session-1',
+      getBackingProvider: providerId => (providerId === 'pooled-backend' ? lifted : undefined),
+      resolveAmbientAuth: async () => ({ ok: true, apiKey: 'ambient' }),
+    })
+    return { service, virtual }
+  }
+
+  it('lets the pooled backend rotate on a stall instead of surfacing it', async () => {
+    vi.useFakeTimers()
+    try {
+      const accountsCalled: string[] = []
+      const { virtual } = nested(accountId => {
+        accountsCalled.push(accountId)
+        return accountId === 'acct-slow' ? silentStream() : okStream('from-acct-fast')
+      })
+      const eventsPromise = collect(virtual.stream(virtual.getModels()[0]!, context))
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(FIRST_TOKEN_TIMEOUT_MS)
+      const events = await eventsPromise
+      expect(events.at(-1)).toMatchObject({ type: 'done' })
+      expect(accountsCalled).toEqual(['acct-slow', 'acct-fast'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('propagates a caller cancel into the pooled backend', async () => {
+    let innerSignal: AbortSignal | undefined
+    let signalCalled: () => void = () => {}
+    const called = new Promise<void>(resolve => { signalCalled = resolve })
+    const { virtual } = nested((_accountId, options) => {
+      innerSignal = options?.signal
+      signalCalled()
+      const stream = createAssistantMessageEventStream()
+      const fail = () => {
+        const failed = message('error', { errorMessage: 'cancelled' })
+        stream.push({ type: 'error', reason: 'aborted', error: failed })
+        stream.end(failed)
+      }
+      if (options?.signal?.aborted === true) fail()
+      else options?.signal?.addEventListener('abort', fail, { once: true })
+      return stream
+    })
+    const controller = new AbortController()
+    const eventsPromise = collect(
+      virtual.stream(virtual.getModels()[0]!, context, { signal: controller.signal }),
+    )
+    await called
+    expect(innerSignal?.aborted).toBe(false)
+    controller.abort()
+    const events = await eventsPromise
+    expect(innerSignal?.aborted).toBe(true)
+    expect(events.at(-1)).toMatchObject({ type: 'error' })
   })
 })

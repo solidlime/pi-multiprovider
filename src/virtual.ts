@@ -263,15 +263,23 @@ function virtualStream<TApi extends Api>(
             response = undefined
             start = undefined
             // Each attempt gets its own abort controller so a first-token stall
-            // tears down just this stream; a caller abort propagates in.
+            // tears down just this stream; a caller abort propagates in. A
+            // pooled backing provider (registered on this same service) owns
+            // its own watchdog and rotation, so wrapping it in a second one
+            // lets this outer timer fire first and cancel the inner rotation;
+            // hand it the caller signal untouched instead.
             const attemptController = new AbortController()
-            attemptOptions.signal = attemptController.signal
+            const pooledBackend = service.hasProvider(backend.providerId)
+            attemptOptions.signal = pooledBackend ? signal : attemptController.signal
             const inner = kind === 'streamSimple'
               ? target.provider.streamSimple(streamModel, context, attemptOptions as SimpleStreamOptions)
               : target.provider.stream(streamModel, context, attemptOptions as ApiStreamOptions<Api>)
+            const guarded = pooledBackend
+              ? inner
+              : firstTokenWatchdog(inner, attemptController, lease.accountId, signal)
 
             let retriedSameAccount = false
-            for await (const event of firstTokenWatchdog(inner, attemptController, lease.accountId, signal)) {
+            for await (const event of guarded) {
               if (event.type === 'start') {
                 start = event
                 continue
