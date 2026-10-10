@@ -49,7 +49,7 @@ export const BACKEND_UNAVAILABLE_PREFIX = 'multiprovider: virtual backend unavai
 // Placeholder credential the virtual provider reports to the host so its
 // models pass auth-availability checks; real auth resolves per attempt at the
 // backing provider layer.
-const VIRTUAL_PLACEHOLDER_API_KEY = 'virtual-provider'
+export const VIRTUAL_PLACEHOLDER_API_KEY = 'virtual-provider'
 
 export function virtualSchedulerId(virtualProviderId: string, modelId: string): string {
   return virtualProviderId + VIRTUAL_ID_SEPARATOR + modelId

@@ -55,6 +55,7 @@ interface ExtensionHarness {
   registry: Map<string, Provider<Api>>
   registerCalls: string[]
   unregisterCalls: string[]
+  provisionalConfigured: Set<string>
   start(sessionId?: string): Promise<void>
   beforeAgentStart(sessionId?: string): Promise<void>
   shutdown(sessionId?: string): Promise<void>
@@ -67,6 +68,7 @@ async function launch(): Promise<ExtensionHarness> {
   const registry = new Map<string, Provider<Api>>()
   const registerCalls: string[] = []
   const unregisterCalls: string[] = []
+  const provisionalConfigured = new Set<string>()
   const handlers = new Map<string, ((event: unknown, ctx: unknown) => Promise<void> | void)[]>()
   const bus = new Map<string, Set<(value: unknown) => void>>()
 
@@ -114,9 +116,19 @@ async function launch(): Promise<ExtensionHarness> {
       list.push(handler)
       handlers.set(name, list)
     },
-    registerProvider(provider: Provider<Api>) {
-      registerCalls.push(provider.id)
-      registry.set(provider.id, provider)
+    registerProvider(providerOrName: Provider<Api> | string, config?: unknown) {
+      if (typeof providerOrName === 'string') {
+        // Mirror the host's synchronous provisional "configured" snapshot: the
+        // string form marks the provider available before the native object
+        // registration lands — and drops any native object already registered
+        // under that id, so an inverted registration order cannot pass here.
+        registerCalls.push(providerOrName)
+        if (config !== undefined) provisionalConfigured.add(providerOrName)
+        registry.delete(providerOrName)
+        return
+      }
+      registerCalls.push(providerOrName.id)
+      registry.set(providerOrName.id, providerOrName)
     },
     unregisterProvider(providerId: string) {
       unregisterCalls.push(providerId)
@@ -148,6 +160,7 @@ async function launch(): Promise<ExtensionHarness> {
     registry,
     registerCalls,
     unregisterCalls,
+    provisionalConfigured,
     start: sessionId => fire('session_start', contextFor(sessionId ?? 'parent')),
     beforeAgentStart: sessionId => fire('before_agent_start', contextFor(sessionId ?? 'parent')),
     shutdown: sessionId => fire('session_shutdown', contextFor(sessionId ?? 'child')),
@@ -194,6 +207,16 @@ describe('shared runtime virtual provider lifetime', () => {
 
     expect(runtime.registry.has('pooled')).toBe(false)
     expect(runtime.unregisterCalls).toContain('pooled')
+  })
+
+  it('establishes provisional auth synchronously before the native registration', async () => {
+    const runtime = await launch()
+    await store.saveVirtualProvider(virtualConfig('pooled'))
+    await runtime.start()
+
+    expect(runtime.provisionalConfigured.has('pooled')).toBe(true)
+    // The native provider object must still win the registry slot.
+    expect(runtime.registry.get('pooled')?.id).toBe('pooled')
   })
 
   it('re-registers the same provider object when the registry entry vanished', async () => {

@@ -50,6 +50,7 @@ import {
   virtualSchedulerId,
 } from '../src/index.ts'
 import { promptApiKeyCredential, probeSessionRuntime, selectLogin, showLoginDialog } from '../src/multilogin.ts'
+import { VIRTUAL_PLACEHOLDER_API_KEY } from '../src/virtual.ts'
 import {
   openPoolManager,
   type PoolManagerAuthMethod,
@@ -830,6 +831,9 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         const ours = virtualProviders.get(config.id)
         if (registered === ours && ours !== undefined) return
         if (ours !== undefined) {
+          // Synchronous provisional configured: closes the availability window that
+          // breaks set_model and the post-shutdown auth recheck.
+          pi.registerProvider(config.id, { apiKey: VIRTUAL_PLACEHOLDER_API_KEY, name: config.label })
           pi.registerProvider(ours)
           return
         }
@@ -878,6 +882,9 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           }
         },
       })
+      // Synchronous provisional configured: closes the availability window that
+      // breaks set_model and the post-shutdown auth recheck.
+      pi.registerProvider(config.id, { apiKey: VIRTUAL_PLACEHOLDER_API_KEY, name: config.label })
       pi.registerProvider(virtualProvider)
       virtualProviders.set(config.id, virtualProvider)
       virtualConfigs.set(config.id, config)
