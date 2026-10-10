@@ -568,7 +568,15 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   const virtualConfigs = new Map<string, VirtualProviderConfig>()
   const virtualProviders = new Map<string, Provider<Api>>()
   const virtualIntegrations = new Map<string, ProviderRegistration<VirtualBackendRef>>()
+  // Instance resources die with the instance, not with a single session: the
+  // shared runtime outlives every session except the last one to shut down.
+  // Only ids are tracked. An ExtensionContext is a live view over its runner,
+  // and Pi core invalidates that runner on session replacement/reload, after
+  // which every ctx access throws "stale after session replacement or reload".
+  // So a captured sibling ctx must never be promoted into currentContext.
+  const aliveSessions = new Set<string>()
   let currentContext: ExtensionContext | undefined
+  let currentSessionId: string | undefined
   let pendingSessionPins: SessionPin[] = []
   let pendingInheritedSessionPins: InheritedSessionPin[] = []
 
@@ -822,11 +830,11 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       const prior = virtualConfigs.get(config.id)
       const configUnchanged = prior !== undefined && JSON.stringify(prior) === JSON.stringify(config)
       if (configUnchanged) {
-        // pi-web shares one modelRegistry across sessions, so a sibling
-        // session's shutdown can drop our entry while our config is intact.
-        // Re-register the same object rather than skipping: a stale skip here
-        // strands the parent session on "Unknown provider". Reusing the
-        // existing object keeps scheduler state single-instanced.
+        // pi-web shares one modelRegistry across sessions, so an external
+        // writer can drop our entry while our config is intact. Re-register
+        // the same object rather than skipping: a stale skip here strands the
+        // session on "Unknown provider". Reusing the existing object keeps
+        // scheduler state single-instanced.
         const registered = currentContext?.modelRegistry.getProvider(config.id)
         const ours = virtualProviders.get(config.id)
         if (registered === ours && ours !== undefined) return
@@ -1018,6 +1026,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   })
 
   pi.on('session_start', async (_event, ctx) => {
+    currentSessionId = ctx.sessionManager.getSessionId()
+    aliveSessions.add(currentSessionId)
     currentContext = ctx
     pendingSessionPins = sessionPinsFromEntries(ctx.sessionManager.getEntries())
     const recordedPools = new Set(pendingSessionPins.map(pin => pin.pool))
@@ -1028,11 +1038,28 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   })
 
   pi.on('before_agent_start', async (_event, ctx) => {
+    currentSessionId = ctx.sessionManager.getSessionId()
+    aliveSessions.add(currentSessionId)
     currentContext = ctx
     await reconcile(ctx)
   })
 
-  pi.on('session_shutdown', () => {
+  // Teardown is instance-scoped, not session-scoped: shared registrations only
+  // come down once the last live session is gone.
+  pi.on('session_shutdown', (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    aliveSessions.delete(sessionId)
+    if (aliveSessions.size > 0) {
+      // Survivors still stream through these registrations, so keep them.
+      // Drop the active context instead of promoting a sibling's captured ctx:
+      // the survivor's next before_agent_start repopulates it, whereas a stale
+      // ctx would throw on every access.
+      if (currentSessionId === sessionId) {
+        currentContext = undefined
+        currentSessionId = undefined
+      }
+      return
+    }
     unsubscribeRegistration()
     for (const providerId of installedProviders.keys()) restoreProvider(providerId, currentContext)
     managedIntegrations.clear()
@@ -1051,6 +1078,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     pendingSessionPins = []
     pendingInheritedSessionPins = []
     currentContext = undefined
+    currentSessionId = undefined
   })
 
   pi.registerCommand('multilogin', {

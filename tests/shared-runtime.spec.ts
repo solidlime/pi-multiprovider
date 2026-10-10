@@ -163,7 +163,9 @@ async function launch(): Promise<ExtensionHarness> {
     provisionalConfigured,
     start: sessionId => fire('session_start', contextFor(sessionId ?? 'parent')),
     beforeAgentStart: sessionId => fire('before_agent_start', contextFor(sessionId ?? 'parent')),
-    shutdown: sessionId => fire('session_shutdown', contextFor(sessionId ?? 'child')),
+    // Same default id as start(): lifecycle is keyed by session id, so a
+    // mismatched default would model a shutdown of a probe that never started.
+    shutdown: sessionId => fire('session_shutdown', contextFor(sessionId ?? 'parent')),
   }
 }
 
@@ -195,6 +197,99 @@ describe('shared runtime virtual provider lifetime', () => {
 
     expect(runtime.registry.get('pooled')).toBe(foreign)
     expect(runtime.unregisterCalls).not.toContain('pooled')
+  })
+
+  it('keeps the shared provider installed for a still-live sibling session', async () => {
+    const runtime = await launch()
+    await store.saveVirtualProvider(virtualConfig('pooled'))
+
+    // Two sessions stream through the same in-process extension instance and
+    // therefore the same virtual provider object. Session B starts last, so it
+    // is the instance's currentContext.
+    await runtime.start('session-a')
+    expect(runtime.registry.get('pooled')).toBeDefined()
+    await runtime.start('session-b')
+    runtime.registerCalls.length = 0
+
+    // Session A ends while session B is still alive.
+    await runtime.shutdown('session-a')
+
+    // Regression: shutdown unregisters the object session B is still resolving
+    // through, so B's next turn dies on Pi core's "Unknown provider: pooled".
+    expect(runtime.registry.get('pooled')).toBeDefined()
+  })
+
+  it('keeps the shared provider when the current session shuts down first', async () => {
+    const runtime = await launch()
+    await store.saveVirtualProvider(virtualConfig('pooled'))
+    await runtime.start('session-a')
+    // B becomes the instance's currentContext without having started first.
+    await runtime.beforeAgentStart('session-b')
+    const ours = runtime.registry.get('pooled')
+    expect(ours).toBeDefined()
+    runtime.registerCalls.length = 0
+
+    await runtime.shutdown('session-b')
+
+    expect(runtime.registry.get('pooled')).toBe(ours)
+    expect(runtime.unregisterCalls).not.toContain('pooled')
+  })
+
+  it('tears down the shared provider once the last session shuts down', async () => {
+    const runtime = await launch()
+    await store.saveVirtualProvider(virtualConfig('pooled'))
+    await runtime.start('session-a')
+    await runtime.start('session-b')
+
+    await runtime.shutdown('session-a')
+    expect(runtime.registry.get('pooled')).toBeDefined()
+
+    await runtime.shutdown('session-b')
+    expect(runtime.registry.has('pooled')).toBe(false)
+    expect(runtime.unregisterCalls).toContain('pooled')
+  })
+
+  it('ignores a shutdown for an unknown session id', async () => {
+    const runtime = await launch()
+    await store.saveVirtualProvider(virtualConfig('pooled'))
+    await runtime.start('session-a')
+    const ours = runtime.registry.get('pooled')
+
+    await runtime.shutdown('ghost')
+
+    expect(runtime.registry.get('pooled')).toBe(ours)
+    expect(runtime.unregisterCalls).not.toContain('pooled')
+  })
+
+  it('does not re-register when a sibling shutdown leaves the entry intact', async () => {
+    const runtime = await launch()
+    await store.saveVirtualProvider(virtualConfig('pooled'))
+    await runtime.start('session-a')
+    const ours = runtime.registry.get('pooled')
+    await runtime.start('session-b')
+    await runtime.shutdown('session-a')
+    runtime.registerCalls.length = 0
+
+    await runtime.beforeAgentStart('session-b')
+
+    expect(runtime.registry.get('pooled')).toBe(ours)
+    expect(runtime.registerCalls).not.toContain('pooled')
+  })
+
+  it('re-registers the provider when a new session starts after full teardown', async () => {
+    const runtime = await launch()
+    await store.saveVirtualProvider(virtualConfig('pooled'))
+    await runtime.start('session-a')
+    const first = runtime.registry.get('pooled')
+    expect(first).toBeDefined()
+
+    await runtime.shutdown('session-a')
+    expect(runtime.registry.has('pooled')).toBe(false)
+
+    await runtime.start('session-b')
+    const second = runtime.registry.get('pooled')
+    expect(second).toBeDefined()
+    expect(second).not.toBe(first)
   })
 
   it('unregisters its own provider object on shutdown', async () => {
